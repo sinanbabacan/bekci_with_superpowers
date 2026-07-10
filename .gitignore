@@ -6,3 +6,6 @@ obj/
 
 # Git worktrees (isolated workspaces)
 .claude/worktrees/
+
+# subagent-driven-development scratch (briefs, review packages, ledger)
+.superpowers/
