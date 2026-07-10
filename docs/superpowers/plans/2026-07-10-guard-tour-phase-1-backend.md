@@ -4,13 +4,13 @@
 
 **Goal:** Build the multi-tenant .NET backend for the Phase 1 guard-tour vertical patrol loop: auth, supervisor route/checkpoint configuration, guard patrol + scan ingestion, and supervisor history — all tenant-isolated and covered by tests.
 
-**Architecture:** Clean Architecture (`Domain` / `Application` / `Infrastructure` / `Api`) mirroring the `sparkion-loyalty` repo. Domain entities use a `Guid`-keyed `Entity` base with `Create` factories. Multi-tenancy is enforced by an EF Core global query filter driven by an `ITenantContext` resolved from a JWT `tenant_id` claim. The device is the source of truth for scan timestamps; the scan ingestion endpoint is idempotent (client-generated GUIDs) and re-validates geo/order on the server.
+**Architecture:** Clean Architecture (`Domain` / `Application` / `Infrastructure` / `Api`), a standard .NET 10 layout. Domain entities are rich: a `Guid`-keyed `Entity` base with private setters, static `Create` factories, and behavior methods that encapsulate invariants. `Guid` keys are used throughout so the offline client can generate `Patrol`/`Scan` IDs before syncing. Multi-tenancy is enforced by an EF Core global query filter driven by an `ITenantContext` resolved from a JWT `tenant_id` claim. The device is the source of truth for scan timestamps; the scan ingestion endpoint is idempotent (client-generated GUIDs) and re-validates geo/order on the server.
 
 **Tech Stack:** .NET 10, ASP.NET Core Web API, EF Core 10 + Npgsql/PostgreSQL, JWT Bearer auth, BCrypt.Net-Next, FluentValidation, xUnit + Testcontainers.PostgreSql + Microsoft.AspNetCore.Mvc.Testing + FluentAssertions.
 
 ## Global Constraints
 
-- **Target framework:** `net10.0` for every project (copy from existing repos).
+- **Target framework:** `net10.0` for every project.
 - **Project prefix / namespaces:** `Bekci.Domain`, `Bekci.Application`, `Bekci.Infrastructure`, `Bekci.Api`, tests in `Bekci.Tests`. Solution file `Bekci.sln` at repo root.
 - **Layout:** source under `src/`, tests under `tests/`.
 - **IDs:** every entity derives from `Bekci.Domain.Entity` (a `Guid Id`). `Patrol` and `Scan` IDs are **client-supplied** GUIDs; all other IDs are server-generated with `Guid.NewGuid()`.
