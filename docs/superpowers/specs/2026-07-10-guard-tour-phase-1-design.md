@@ -45,8 +45,10 @@ get its own spec → plan → build cycle.
   - Add `Checkpoint`s (QR identifier, GPS lat/lng, geofence radius, sequence #).
 - Guard patrol:
   - Log in, see routes at their site, **start a patrol**.
-  - Scan checkpoints (QR + GPS) **fully offline**.
-  - Sync queued data when back online.
+  - Scan checkpoints (QR + GPS); when online, each scan is **sent to the server
+    immediately**.
+  - When offline, scans are **queued locally and flushed automatically** when
+    connection returns (guard is never blocked).
 - Supervisor history:
   - View completed/in-progress patrols and each scan (refresh-based, no live push).
 
@@ -80,7 +82,8 @@ Matches existing repos (`sparkion-loyalty`, `ThePlaceApi`).
 - Flutter, clean architecture: **presentation / domain / data**.
 - **Riverpod** for state management.
 - **Dio + Retrofit** for API access.
-- **Drift (SQLite)** for the offline store + a sync engine.
+- **Drift (SQLite)** for a lightweight local store: a read-only cache of
+  route/checkpoint reference data + an offline send queue.
 - `mobile_scanner` for QR scanning.
 - `geolocator` for GPS.
 - `connectivity_plus` to trigger sync flushes.
@@ -101,7 +104,7 @@ All entities carry `TenantId` and are filtered globally by it.
 | `Route` | Id, SiteId, Name, EnforceOrder (bool) | |
 | `Checkpoint` | Id, RouteId, Name, QrCode (unique-per-route string), Lat, Lng, GeofenceRadiusM, Sequence | `QrCode` is what's printed on the sticker |
 | `Patrol` | Id, RouteId, GuardId, StartedAt, CompletedAt?, Status (`InProgress`/`Completed`/`Abandoned`) | One guard's execution of a route |
-| `Scan` | Id, PatrolId, CheckpointId, ScannedAt (device time), ReceivedAt (server time), Lat, Lng, GeoValid (bool), OrderValid (bool), IsDuplicate (bool) | Created on device, uploaded in batch |
+| `Scan` | Id, PatrolId, CheckpointId, ScannedAt (device time), ReceivedAt (server time), Lat, Lng, GeoValid (bool), OrderValid (bool), IsDuplicate (bool) | Created on device; sent immediately when online, queued when offline |
 
 `Patrol.Id` and `Scan.Id` are **client-generated GUIDs** so the device can create
 them offline and uploads stay idempotent.
@@ -113,14 +116,17 @@ them offline and uploads stay idempotent.
 - EF Core global query filter on `TenantId` ensures no query can leak across
   organizations.
 
-### 4.3 Sync ingestion (the critical endpoint)
+### 4.3 Scan ingestion (the critical endpoint)
 
-`POST /patrols/{id}/scans` accepts a **batch** of scans with client-generated
-GUIDs.
+`POST /patrols/{id}/scans` accepts **one or more** scans with client-generated
+GUIDs. Online, the app posts a single scan the moment it happens; when flushing a
+backlog after a dead zone, it posts the queued scans together.
 
-- **Idempotent:** re-uploading a scan with an existing GUID is a no-op.
-- The device is the source of truth for **when** a scan happened
-  (`ScannedAt` = device time). The server records `ReceivedAt` separately.
+- **Idempotent:** posting a scan with an existing GUID is a no-op. This covers
+  both offline-flush retries and the online case where an immediate send times out
+  and is retried.
+- The device records **when** a scan happened (`ScannedAt` = device time). The
+  server records `ReceivedAt` separately.
 - The server **re-validates** `GeoValid` and `OrderValid` on ingestion; the
   server verdict is authoritative for reports. (Device values can't be trusted
   blindly.)
@@ -142,47 +148,54 @@ GUIDs.
 
 ---
 
-## 5. Mobile App: Offline-First Architecture
+## 5. Mobile App: Online-First with Offline Send Queue
 
 ### 5.1 Layering
 
 - **presentation** — screens + Riverpod controllers, role-routed at login
   (`Supervisor` → dashboard, `Guard` → patrol home).
 - **domain** — entities + repository interfaces + use cases (StartPatrol,
-  RecordScan, SyncPatrol).
-- **data** — two sources behind each repository: **local (Drift/SQLite)** and
-  **remote (Retrofit/Dio)**.
+  RecordScan, CompletePatrol).
+- **data** — behind each repository: **remote (Retrofit/Dio)** is the primary
+  path, plus a **local (Drift/SQLite)** store with two narrow jobs:
+  1. a **read-only cache** of route/checkpoint reference data, so a scanned QR can
+     be matched and validated even without a connection;
+  2. a **send queue** of operations that couldn't be sent immediately.
 
-**The local Drift DB is the source of truth on-device.** The guard flow never
-touches the network directly — it reads/writes Drift; a background sync engine
-reconciles with the server.
+**The server is the source of truth.** When online, the guard flow talks to the
+server directly and records nothing durable on-device beyond the reference cache.
+The send queue exists only to bridge dead zones.
 
 ### 5.2 Guard patrol flow
 
-1. At a site with signal, guard opens app → routes for their site are fetched and
-   **cached to Drift** (checkpoints, QR codes, coordinates all stored locally).
-2. Guard taps a route → **StartPatrol** creates a local `Patrol` row (client GUID,
-   status `InProgress`). Fully offline from here on.
+1. While online, routes for the guard's site are fetched and **cached to Drift**
+   (checkpoints, QR codes, coordinates) as read-only reference data.
+2. Guard taps a route → **StartPatrol**. If online, the patrol is created on the
+   server immediately (client GUID, status `InProgress`); if offline, it's created
+   with a client GUID and enqueued.
 3. At each checkpoint:
    - Scan QR (`mobile_scanner`) → match `QrCode` against cached checkpoints.
    - Grab GPS (`geolocator`).
    - Compute `GeoValid` (within radius?) and `OrderValid` (respects
      `EnforceOrder`?).
-   - Write a local `Scan` row with `syncStatus = pending`.
-   - Instant feedback, no network.
-4. Guard taps Complete → local patrol marked `Completed`, queued for sync.
+   - **If online, POST the scan immediately.** If the send fails or the device is
+     offline, write it to the send queue (`syncStatus = pending`).
+   - Instant on-screen feedback either way — the network round-trip never blocks
+     the guard.
+4. Guard taps Complete → sent immediately if online, otherwise enqueued.
 
-### 5.3 Sync engine
+### 5.3 Send queue
 
-- A repository-level queue: any `pending` row (patrol start, scans, completion) is
-  pushed when connectivity returns.
+- **Primary path is immediate send.** The queue only holds operations (patrol
+  start, scans, completion) that couldn't reach the server.
 - Flush triggers: `connectivity_plus` regains connection, a manual "Sync now"
-  button, and on-app-resume.
-- Idempotent uploads via client GUIDs → safe to retry. Rows flip
-  `pending → synced`; failures stay `pending` and back off.
-- **Conflict handling is minimal by design:** the device owns patrol/scan
-  creation and the server never mutates them, so there is no merge conflict —
-  only at-least-once delivery deduped by GUID.
+  button, and on-app-resume. Queued rows flip `pending → synced`; failures stay
+  `pending` and back off.
+- Idempotent sends via client GUIDs → safe to retry, whether the retry is a
+  dead-zone flush or an online send that timed out.
+- **No merge conflicts by design:** the device generates the operations and the
+  server never mutates patrols/scans — only at-least-once delivery deduped by
+  GUID.
 
 ### 5.4 Supervisor flow (Phase 1)
 
@@ -219,8 +232,9 @@ reconciles with the server.
 - **Out-of-order scan** with `EnforceOrder = true` → record it, set
   `OrderValid = false`, warn the guard, let them continue. Supervisor sees the
   flag.
-- **App killed mid-patrol** → in-progress patrol and scans already persisted in
-  Drift; on relaunch the guard resumes where they left off.
+- **App killed mid-patrol** → already-sent scans live on the server; any un-sent
+  operations remain in the local send queue. On relaunch the guard resumes and the
+  queue flushes.
 - **Route edited by supervisor after caching** → the active patrol uses its cached
   snapshot; refreshes on next patrol start (no mid-patrol surprises).
 
@@ -240,15 +254,16 @@ reconciles with the server.
   including idempotency and re-upload.
 
 ### Mobile
-- Unit tests for the sync engine (pending→synced, retry/backoff, GUID dedupe) and
-  scan validation logic.
+- Unit tests for the send queue (immediate send, enqueue-on-failure, flush,
+  retry/backoff, GUID dedupe) and scan validation logic.
 - Repository tests against an in-memory Drift DB.
 - Widget test for the core scan-feedback screen.
 
 ### Critical path to prove end-to-end
-Start patrol offline → scan several checkpoints (one out-of-order, one no-GPS)
-offline → regain connectivity → everything syncs exactly once → server verdicts
-match device verdicts → supervisor sees correct flags.
+Scan a checkpoint online → confirm it reaches the server immediately → enter a
+dead zone → scan several more checkpoints (one out-of-order, one no-GPS), which
+queue locally → regain connectivity → the queue flushes exactly once → server
+verdicts match device verdicts → supervisor sees correct flags.
 
 ---
 
