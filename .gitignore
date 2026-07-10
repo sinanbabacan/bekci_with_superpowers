@@ -3,3 +3,6 @@ build/
 bin/
 obj/
 *.user
+
+# Git worktrees (isolated workspaces)
+.claude/worktrees/
