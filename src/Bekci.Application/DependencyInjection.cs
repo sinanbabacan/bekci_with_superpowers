@@ -12,6 +12,7 @@ public static class DependencyInjection
         services.AddScoped<CheckpointService>();
         services.AddScoped<PatrolService>();
         services.AddScoped<ScanService>();
+        services.AddScoped<PatrolQueryService>();
         return services;
     }
 }
