@@ -8,6 +8,7 @@ public static class DependencyInjection
     public static IServiceCollection AddApplication(this IServiceCollection services)
     {
         services.AddScoped<SiteService>();
+        services.AddScoped<RouteService>();
         return services;
     }
 }
