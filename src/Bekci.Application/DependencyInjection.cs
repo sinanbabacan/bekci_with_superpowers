@@ -11,6 +11,7 @@ public static class DependencyInjection
         services.AddScoped<RouteService>();
         services.AddScoped<CheckpointService>();
         services.AddScoped<PatrolService>();
+        services.AddScoped<ScanService>();
         return services;
     }
 }
