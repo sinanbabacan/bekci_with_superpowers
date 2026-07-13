@@ -9,6 +9,7 @@ public static class DependencyInjection
     {
         services.AddScoped<SiteService>();
         services.AddScoped<RouteService>();
+        services.AddScoped<CheckpointService>();
         return services;
     }
 }
