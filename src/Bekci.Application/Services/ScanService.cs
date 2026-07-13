@@ -20,98 +20,103 @@ public sealed class ScanService(Repository db, ITenantContext tenant)
             .OrderBy(c => c.Sequence)
             .ToListAsync(ct);
 
-        // Existing scans for this patrol (source of truth for dedupe + ordering).
-        var existing = await db.Scans.Where(x => x.PatrolId == patrolId).ToListAsync(ct);
-        var results = new List<ScanResult>();
-        var newlyAdded = new List<Scan>();
+        // Bounded retry: on a PK conflict, only the scans whose client-supplied ScanId raced with a
+        // concurrent insert actually fail - the rest of the batch is lost too, because SaveChangesAsync
+        // is one transaction and a single PK violation rolls the whole thing back. Rather than surfacing
+        // that as a hard failure (which would also drop the genuinely-new, non-conflicting scans from
+        // this attempt), we detach our failed adds and re-run the compute+add pass once more. On the
+        // retry, the previously-conflicting ScanIds are now visible in `existing` (freshly re-queried),
+        // so the idempotent "already stored" check above skips them and only the still-new scans get
+        // added - that second SaveChangesAsync succeeds. Capped at 2 attempts total so a non-conflict
+        // related DbUpdateException (e.g. a genuine DB outage) still surfaces instead of looping.
+        const int maxAttempts = 2;
+        List<ScanResult> results = [];
 
-        // Process inputs in ScannedAt order so ordering verdicts are deterministic.
-        foreach (var input in req.Scans.OrderBy(x => x.ScannedAt))
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            var already = existing.FirstOrDefault(x => x.Id == input.ScanId);
-            if (already is not null)
+            // Existing scans for this patrol (source of truth for dedupe + ordering). Re-queried fresh
+            // on every attempt so a retry sees whatever the previous attempt's conflicting winners wrote.
+            var existing = await db.Scans.AsNoTracking().Where(x => x.PatrolId == patrolId).ToListAsync(ct);
+            results = [];
+            var newlyAdded = new List<Scan>();
+
+            // Process inputs in ScannedAt order so ordering verdicts are deterministic.
+            foreach (var input in req.Scans.OrderBy(x => x.ScannedAt))
             {
-                results.Add(new ScanResult(already.Id, already.GeoValid, already.OrderValid, already.IsDuplicate));
-                continue;
+                var already = existing.FirstOrDefault(x => x.Id == input.ScanId);
+                if (already is not null)
+                {
+                    results.Add(new ScanResult(already.Id, already.GeoValid, already.OrderValid, already.IsDuplicate));
+                    continue;
+                }
+
+                var cp = checkpoints.FirstOrDefault(c => c.Id == input.CheckpointId);
+                if (cp is null)
+                    throw new InvalidOperationException("Checkpoint is not part of this patrol's route.");
+
+                var geoValid = ScanValidation.IsWithinGeofence(cp.Lat, cp.Lng, cp.GeofenceRadiusM, input.Lat, input.Lng);
+
+                var alreadyScannedThisCp = existing.Any(x => x.CheckpointId == cp.Id);
+                var isDuplicate = alreadyScannedThisCp;
+
+                bool orderValid;
+                if (!route.EnforceOrder)
+                {
+                    orderValid = true;
+                }
+                else
+                {
+                    // Next expected = first checkpoint by sequence that comes after the patrol's
+                    // furthest progress so far (the highest sequence number scanned to date) and is
+                    // not itself already scanned. Using "furthest progress" rather than "any unscanned
+                    // checkpoint" means that once the guard scans ahead (e.g. cp2 before cp1), earlier,
+                    // skipped checkpoints (cp1) are no longer considered "next expected" - scanning them
+                    // later is out of order too, not just the checkpoint that jumped ahead.
+                    var scannedCheckpointIds = existing.Select(x => x.CheckpointId).ToHashSet();
+                    var maxScannedSequence = checkpoints
+                        .Where(c => scannedCheckpointIds.Contains(c.Id))
+                        .Select(c => (int?)c.Sequence)
+                        .Max() ?? 0;
+                    var nextExpected = checkpoints.FirstOrDefault(c =>
+                        c.Sequence > maxScannedSequence && !scannedCheckpointIds.Contains(c.Id));
+                    orderValid = nextExpected is not null && nextExpected.Id == cp.Id;
+                }
+
+                var scan = Scan.Record(
+                    input.ScanId, tenant.TenantId, patrolId, cp.Id,
+                    DateTime.SpecifyKind(input.ScannedAt, DateTimeKind.Utc),
+                    DateTime.UtcNow, input.Lat, input.Lng, geoValid, orderValid, isDuplicate);
+
+                db.Scans.Add(scan);
+                newlyAdded.Add(scan);
+                existing.Add(scan); // affects ordering/dedupe of subsequent inputs in the same batch
+                results.Add(new ScanResult(scan.Id, geoValid, orderValid, isDuplicate));
             }
 
-            var cp = checkpoints.FirstOrDefault(c => c.Id == input.CheckpointId);
-            if (cp is null)
-                throw new InvalidOperationException("Checkpoint is not part of this patrol's route.");
-
-            var geoValid = ScanValidation.IsWithinGeofence(cp.Lat, cp.Lng, cp.GeofenceRadiusM, input.Lat, input.Lng);
-
-            var alreadyScannedThisCp = existing.Any(x => x.CheckpointId == cp.Id);
-            var isDuplicate = alreadyScannedThisCp;
-
-            bool orderValid;
-            if (!route.EnforceOrder)
+            try
             {
-                orderValid = true;
+                await db.SaveChangesAsync(ct);
+                break; // success - stop retrying
             }
-            else
+            catch (DbUpdateException)
             {
-                // Next expected = first checkpoint by sequence that comes after the patrol's
-                // furthest progress so far (the highest sequence number scanned to date) and is
-                // not itself already scanned. Using "furthest progress" rather than "any unscanned
-                // checkpoint" means that once the guard scans ahead (e.g. cp2 before cp1), earlier,
-                // skipped checkpoints (cp1) are no longer considered "next expected" - scanning them
-                // later is out of order too, not just the checkpoint that jumped ahead.
-                var scannedCheckpointIds = existing.Select(x => x.CheckpointId).ToHashSet();
-                var maxScannedSequence = checkpoints
-                    .Where(c => scannedCheckpointIds.Contains(c.Id))
-                    .Select(c => (int?)c.Sequence)
-                    .Max() ?? 0;
-                var nextExpected = checkpoints.FirstOrDefault(c =>
-                    c.Sequence > maxScannedSequence && !scannedCheckpointIds.Contains(c.Id));
-                orderValid = nextExpected is not null && nextExpected.Id == cp.Id;
-            }
+                // Lost a race: a concurrent request already persisted one or more of the client-supplied
+                // ScanIds in this batch (Scan.Id is the PK), so this insert violated the PK/unique
+                // constraint. Detach every entity we just tried to add - they're still tracked by the
+                // change tracker despite the failed save, so a subsequent tracked query would just hand
+                // back these same broken instances (or throw on identity-map conflicts once the retry
+                // re-adds a fresh instance with the same key).
+                foreach (var added in newlyAdded)
+                    db.Entry(added).State = EntityState.Detached;
 
-            var scan = Scan.Record(
-                input.ScanId, tenant.TenantId, patrolId, cp.Id,
-                DateTime.SpecifyKind(input.ScannedAt, DateTimeKind.Utc),
-                DateTime.UtcNow, input.Lat, input.Lng, geoValid, orderValid, isDuplicate);
+                if (attempt >= maxAttempts)
+                    // Exhausted retries - this isn't converging via the idempotent-skip path (e.g. a
+                    // genuine DB outage), so surface the failure instead of looping forever.
+                    throw;
 
-            db.Scans.Add(scan);
-            newlyAdded.Add(scan);
-            existing.Add(scan); // affects ordering/dedupe of subsequent inputs in the same batch
-            results.Add(new ScanResult(scan.Id, geoValid, orderValid, isDuplicate));
-        }
-
-        try
-        {
-            await db.SaveChangesAsync(ct);
-        }
-        catch (DbUpdateException)
-        {
-            // Lost a race: a concurrent request already persisted one or more of the client-supplied
-            // ScanIds in this batch (Scan.Id is the PK), so this insert violated the PK/unique
-            // constraint. Recover instead of surfacing the exception - detach every entity we just
-            // tried to add (they're still tracked by the change tracker despite the failed save, so a
-            // tracked re-query would just hand back these same broken instances), then re-query with
-            // AsNoTracking() to fetch whatever the winning request actually persisted and swap those
-            // verdicts into the results in place of our locally-computed ones.
-            foreach (var added in newlyAdded)
-                db.Entry(added).State = EntityState.Detached;
-
-            var addedIds = newlyAdded.Select(x => x.Id).ToHashSet();
-            var winners = await db.Scans.AsNoTracking()
-                .Where(x => addedIds.Contains(x.Id))
-                .ToListAsync(ct);
-
-            if (winners.Count != addedIds.Count)
-                // SaveChangesAsync is one transaction: a PK conflict on any single scan rolls back
-                // the whole batch, so any of our newlyAdded scans that DIDN'T conflict are also not
-                // persisted and won't show up here. Rather than silently reporting success for scans
-                // that were never written, surface the failure so the client resubmits the batch -
-                // the retry is safe because every scan in it is idempotent on its own ScanId.
-                throw;
-
-            for (var i = 0; i < results.Count; i++)
-            {
-                var winner = winners.FirstOrDefault(w => w.Id == results[i].ScanId);
-                if (winner is not null)
-                    results[i] = new ScanResult(winner.Id, winner.GeoValid, winner.OrderValid, winner.IsDuplicate);
+                // Otherwise fall through to the next attempt: `existing` will be re-queried fresh above,
+                // which now includes whatever the racing request(s) committed, so the idempotent
+                // "already stored" check will skip those ScanIds and only genuinely-new scans get added.
             }
         }
 
