@@ -25,4 +25,11 @@ public sealed class PatrolsController(
         var result = await scanService.IngestAsync(id, req, ct);
         return Ok(result);
     }
+
+    [HttpPost("{id:guid}/complete")]
+    public async Task<IActionResult> Complete(Guid id, [FromBody] CompletePatrolRequest req, CancellationToken ct)
+    {
+        var patrol = await service.CompleteAsync(id, req.CompletedAt, ct);
+        return patrol is null ? NotFound() : Ok(patrol);
+    }
 }

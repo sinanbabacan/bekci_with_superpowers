@@ -52,6 +52,21 @@ public sealed class PatrolService(Repository db, ITenantContext tenant)
         }
     }
 
+    public async Task<PatrolResponse?> CompleteAsync(Guid patrolId, DateTime completedAt, CancellationToken ct)
+    {
+        var patrol = await db.Patrols.FirstOrDefaultAsync(p => p.Id == patrolId, ct);
+        if (patrol is null)
+            return null;
+
+        if (patrol.Status != Domain.PatrolStatus.Completed)
+        {
+            patrol.Complete(DateTime.SpecifyKind(completedAt, DateTimeKind.Utc));
+            await db.SaveChangesAsync(ct);
+        }
+
+        return Map(patrol);
+    }
+
     private static PatrolResponse Map(Patrol p) =>
         new(p.Id, p.RouteId, p.GuardId, p.StartedAt, p.CompletedAt, p.Status.ToString());
 }
