@@ -15,6 +15,7 @@ builder.Services.AddInfrastructure(builder.Configuration);
 
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<ITenantContext, TenantContext>();
+builder.Services.AddScoped<ICurrentUser, CurrentUser>();
 builder.Services.AddScoped<AuthService>();
 
 var jwt = builder.Configuration.GetSection("Jwt");
@@ -44,8 +45,9 @@ var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<Repository>();
-    // No EF migrations exist yet (added in Task 8); Migrate() would otherwise create an
-    // empty __EFMigrationsHistory table that then blocks EnsureCreated() in tests.
+    // Migrations exist as of Task 8, so this runs Migrate() on startup (including in the
+    // WebApplicationFactory test host). Integration tests that call EnsureCreated() still work:
+    // once the schema is migrated, EnsureCreated() is a no-op against the already-created DB.
     if (db.Database.GetMigrations().Any())
         db.Database.Migrate();
 }
